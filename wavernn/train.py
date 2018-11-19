@@ -1,215 +1,151 @@
-# coding: utf-8
-
-# Conversion of nb5b notebook from https://github.com/fatchord/WaveRNN
-
-# ## Alternative Model (Training)
-#
-# I've found WaveRNN quite slow to train so here's an alternative that utilises the optimised rnn kernels in Pytorch. The model below is much much faster to train, it will converge in 48hrs when training on 22.5kHz samples (or 24hrs using 16kHz samples) on a single GTX1080. It also works quite well with predicted GTA features.
-#
-# The model is simply two residual GRUs in sequence and then three dense layers with a 512 softmax output. This is supplemented with an upsampling network.
-#
-# Since the Pytorch rnn kernels are 'closed', the options for conditioning sites are greatly reduced. Here's the strategy I went with given that restriction:
-#
-# 1 - Upsampling: Nearest neighbour upsampling followed by 2d convolutions with 'horizontal' kernels to interpolate. Split up into two or three layers depending on the stft hop length.
-#
-# 2 - A 1d resnet with a 5 wide conv input and 1x1 res blocks. Not sure if this is necessary, but the thinking behind it is: the upsampled features give a local view of the conditioning - why not supplement that with a much wider view of conditioning features, including a peek at the future. One thing to note is that the resnet layers are computed only once and in parallel, so it shouldn't slow down training/generation much.
-#
-# There's a good chance this model needs regularisation since it overfits a little, so for now train it to ~500k steps for best results.
-
-# In[1]:
-
-
 import os
-import matplotlib.pyplot as plt
-import math
 import pickle
-import os
+import time
+
 import numpy as np
 import torch
-from torch.autograd import Variable
-from torch import optim
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from .utils import *
-from .dsp import *
-from .model import Model
-from .model import bits
+from datasets.audio import save_wavernn_wav
+from hparams import hparams_debug_string
+from infolog import log
+from torch import optim
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from wavernn.model import Model
+
+_batch_size = 32
+_bits = 9
+_pad = 2
+_hop_len = 275
+_seq_len = _hop_len * 5
+_mel_win = _seq_len // _hop_len + 2 * _pad
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
 class AudiobookDataset(Dataset):
     def __init__(self, ids, path):
+        self.ids = ids
         self.path = path
-        self.metadata = ids
 
     def __getitem__(self, index):
-        file = self.metadata[index]
-        m = np.load(f'{self.path}mel/{file}.npy')
-        x = np.load(f'{self.path}quant/{file}.npy')
+        id = self.ids[index]
+        m = np.load(f'{self.path}/mels/{id}.npy')
+        x = np.load(f'{self.path}/quant/{id}.npy')
         return m, x
 
     def __len__(self):
-        return len(self.metadata)
+        return len(self.ids)
 
 
 def collate(batch):
+    mels = []
+    coarse = []
+    for x in batch:
+        max_offset = x[0].shape[-1] - (_mel_win + 2 * _pad)
+        mel_offset = np.random.randint(0, max_offset)
+        sig_offset = (mel_offset + _pad) * _hop_len
+        mels.append(x[0][:, mel_offset:(mel_offset + _mel_win)])
+        coarse.append(x[1][sig_offset:(sig_offset + _seq_len + 1)])
 
-    pad = 2
-    mel_win = seq_len // hop_length + 2 * pad
-    max_offsets = [x[0].shape[-1] - (mel_win + 2 * pad) for x in batch]
-    mel_offsets = [np.random.randint(0, offset) for offset in max_offsets]
-    sig_offsets = [(offset + pad) * hop_length for offset in mel_offsets]
+    mels = torch.FloatTensor(np.stack(mels).astype(np.float32))
+    coarse = torch.LongTensor(np.stack(coarse).astype(np.int64))
 
-    mels = [x[0][:, mel_offsets[i]:mel_offsets[i] + mel_win]
-            for i, x in enumerate(batch)]
-
-    coarse = [x[1][sig_offsets[i]:sig_offsets[i] + seq_len + 1]
-              for i, x in enumerate(batch)]
-
-    mels = np.stack(mels).astype(np.float32)
-    coarse = np.stack(coarse).astype(np.int64)
-
-    mels = torch.FloatTensor(mels)
-    coarse = torch.LongTensor(coarse)
-
-    x_input = 2 * coarse[:, :seq_len].float() / (2**bits - 1.) - 1.
-
+    x_input = 2 * coarse[:, :_seq_len].float() / (2**_bits - 1.) - 1.
     y_coarse = coarse[:, 1:]
 
     return x_input, mels, y_coarse
 
 
-
-def _generate(step, samples=3):
-    outputs = []
-    k = step // 1000
-    test_mels = [np.load(f'{DATA_PATH}mel/{id}.npy')
-                 for id in test_ids[:samples]]
-    ground_truth = [np.load(f'{DATA_PATH}quant/{id}.npy')
-                    for id in test_ids[:samples]]
-    print("test_ids: " + str(test_ids[:samples]))
-    for i, (gt, mel) in enumerate(zip(ground_truth, test_mels)):
-        print('\nGenerating: %i/%i' % (i+1, samples))
-        gt = 2 * gt.astype(np.float32) / (2**bits - 1.) - 1.
-        librosa.output.write_wav(
-            f'{GEN_PATH}{k}k_steps_{i}_target.wav', gt, sr=sample_rate)
-        outputs.append(model.generate(
-            mel, f'{GEN_PATH}{k}k_steps_{i}_generated.wav'))
-    return outputs
+def test_generate(model, step, input_dir, ouput_dir, sr, samples=3):
+    filenames = [f for f in sorted(os.listdir(input_dir)) if f.endswith('.npy')]
+    for i in tqdm(range(samples)):
+        mel = np.load(os.path.join(input_dir, filenames[i])).T
+        save_wavernn_wav(model.generate(mel), f'{ouput_dir}/{step // 1000}k_steps_{i}.wav', sr)
 
 
-def _train(model, dataset, optimiser, epochs, batch_size, classes, seq_len, step, lr=1e-4):
+def train(args, log_dir, input_dir, hparams):
+    test_dir = os.path.join(args.base_dir, 'tacotron_output', 'eval')
+    save_dir = os.path.join(log_dir, 'wavernn_pretrained')
+    eval_dir = os.path.join(log_dir, 'eval-dir')
+    eval_wav_dir = os.path.join(eval_dir, 'wavs')
+    os.makedirs(save_dir, exist_ok=True)
+    os.makedirs(eval_wav_dir, exist_ok=True)
 
-    loss_threshold = 4.0
+    checkpoint_path = os.path.join(save_dir, 'wavernn_model.pyt')
 
-    for p in optimiser.param_groups:
-        p['lr'] = lr
+    log('Checkpoint path: {}'.format(checkpoint_path))
+    log('Loading training data from: {}'.format(input_dir))
+    log('Using model: {}'.format(args.model))
+    log(hparams_debug_string())
+
+    # Load Dataset
+    with open(f'{input_dir}/dataset_ids.pkl', 'rb') as f:
+        dataset = AudiobookDataset(pickle.load(f), input_dir)
+
+    data_loader = DataLoader(dataset, collate_fn=collate, batch_size=_batch_size, shuffle=True, pin_memory=True)
+
+    # Initialize Model
+    model = Model(rnn_dims=512, fc_dims=512, bits=_bits, pad=_pad,
+                  upsample_factors=(5, 5, 11), feat_dims=80,
+                  compute_dims=128, res_out_dims=128, res_blocks=10).to(device)
+
+    # Load Model
+    if not os.path.exists(checkpoint_path):
+        log('Created new model!!!', slack=True)
+        torch.save({'state_dict': model.state_dict(), 'global_step': 0}, checkpoint_path)
+    else:
+        log('Loading model from {}'.format(checkpoint_path), slack=True)
+
+    # Load Parameters
+    if torch.cuda.is_available():
+        checkpoint = torch.load(checkpoint_path)
+    else:
+        checkpoint = torch.load(checkpoint_path, map_location=lambda storage, loc: storage)
+
+    model.load_state_dict(checkpoint['state_dict'])
+
+    step = checkpoint['global_step']
+    log('Starting from {} step'.format(step), slack=True)
+
+    optimiser = optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.NLLLoss().to(device)
 
-    for e in range(epochs):
-
-        trn_loader = DataLoader(dataset, collate_fn=collate, batch_size=batch_size,
-                                num_workers=2, shuffle=True, pin_memory=True)
-
+    # Train
+    for e in range(args.wavernn_train_epochs):
         running_loss = 0.
-        val_loss = 0.
         start = time.time()
-        running_loss = 0.
 
-        iters = len(trn_loader)
+        for i, (x, m, y) in enumerate(data_loader):
+            x, m, y = x.to(device), m.to(device), y.to(device).unsqueeze(-1)
+            y_hat = model(x, m).transpose(1, 2).unsqueeze(-1)
 
-        for i, (x, m, y) in enumerate(trn_loader):
-
-            x, m, y = x.to(device), m.to(device), y.to(device)
-
-            y_hat = model(x, m)
-            y_hat = y_hat.transpose(1, 2).unsqueeze(-1)
-            y = y.unsqueeze(-1)
             loss = criterion(y_hat, y)
 
             optimiser.zero_grad()
             loss.backward()
             optimiser.step()
-            running_loss += loss.item()
 
-            speed = (i + 1) / (time.time() - start)
+            item_loss = loss.item()
+            running_loss += item_loss
             avg_loss = running_loss / (i + 1)
 
             step += 1
-            k = step // 1000
-            print('Epoch: %i/%i -- Batch: %i/%i -- Loss: %.3f -- Speed: %.2f steps/sec -- Step: %ik ' %
-                  (e + 1, epochs, i + 1, iters, avg_loss, speed, k))
+            speed = (i + 1) / (time.time() - start)
 
-        # generate sample
-        if e % 20 == 0:
-            _generate(step=step, samples=1)
+            message = 'Step {:7d} [{:.3f} sec/step, loss={:.5f}, avg_loss={:.5f}]'.format(step, speed, item_loss, avg_loss)
+            log(message, end='\r')
 
-        torch.save(model.state_dict(), MODEL_PATH)
-        np.save(STEP_PATH, [step])
-        print(' <saved>')
+        # Save Checkpoint and Eval Wave
+        if (e + 1) % 30 == 0:
+            log('\nSaving model at step {}'.format(step), end='', slack=True)
+            torch.save({'state_dict': model.state_dict(), 'global_step': step}, checkpoint_path)
+            test_generate(model, step, test_dir, eval_wav_dir, hparams.sample_rate)
 
-
-def train(cfg):
-    if not os.path.exists(model_checkpoints):
-        os.makedirs(model_checkpoints)
-
-    if not os.path.exists(GEN_PATH):
-        os.makedirs(GEN_PATH)
-
-    with open(f'{DATA_PATH}dataset_ids.pkl', 'rb') as f:
-        dataset_ids = pickle.load(f)
-
-    test_ids = dataset_ids[-50:]
-    dataset_ids = dataset_ids[:-50]
-
-    dataset = AudiobookDataset(dataset_ids, DATA_PATH)
-
-    data_loader = DataLoader(dataset, collate_fn=collate, batch_size=32,
-                             num_workers=0, shuffle=True)
-
-    print("len: " + str(len(dataset)))
-
-    x, m, y = next(iter(data_loader))
-    x.shape, m.shape, y.shape
-
-    # plot(x.numpy()[0])
-    # plot(y.numpy()[0])
-    # plot_spec(m.numpy()[0])
-
-    model = Model(rnn_dims=512, fc_dims=512, bits=bits, pad=2,
-                  upsample_factors=(5, 5, 11), feat_dims=80,
-                  compute_dims=128, res_out_dims=128, res_blocks=10).to(device)
-
-    if not os.path.exists(MODEL_PATH):
-        print("Storing empty model")
-        torch.save(model.state_dict(), MODEL_PATH)
-    print("Loading model from " + MODEL_PATH)
-    model.load_state_dict(torch.load(MODEL_PATH))
-
-    mels, aux = model.preview_upsampling(m.to(device))
-
-    # plot_spec(m[0].numpy())
-    # plot_spec(mels[0].cpu().detach().numpy().T)
-    # plot_spec(aux[0].cpu().detach().numpy().T)
-
-    step = 0
-    if not os.path.exists(STEP_PATH):
-        np.save(STEP_PATH, [step])
-    step = np.load(STEP_PATH)[0]
-    print("starting from step: " + str(step))
-
-    optimiser = optim.Adam(model.parameters())
-
-    _train(model, dataset, optimiser, epochs=1000, batch_size=16, classes=2**bits,
-           seq_len=seq_len, step=step, lr=1e-4)
-
-    # ## Generate Samples
-
-    # generate()
-    # plot(output)
-    # print(step)
+        log('\nFinished {} epoch. Starting next epoch...'.format(e + 1))
 
 
-if __name__ == '__main__':
-    train(None)
+def wavernn_train(args, log_dir, hparams):
+    input_dir = os.path.join(args.base_dir, 'wavernn_data')
+
+    train(args, log_dir, input_dir, hparams)
